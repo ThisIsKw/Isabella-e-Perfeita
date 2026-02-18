@@ -181,6 +181,10 @@ local function getPing()
     return pingCache
 end
 
+-- Cache de velocidade e aceleração (declarados aqui pois AcharMurderRapido os usa)
+local velocityHistory = {}
+local accelerationHistory = {}
+
 local function AcharMurderRapido()
     local currentTime = tick()
     
@@ -269,31 +273,33 @@ local function DesequiparArmaRapido()
     end
 end
 
--- Smoothing leve: 2 amostras (~16ms a 60fps) — retira ruído de rede sem atrasar o lead
-local velocityHistory = {}
-local accelerationHistory = {} -- NOVO: detecta mudanças de direção
+-- Weighted smoothing com 4 amostras: pesos 1-2-3-4 (mais recente = mais influência)
+-- Reduz jitter de rede mas reage rápido a mudanças bruscas de direção
+local W_TOTAL = 10 -- 1+2+3+4
 
 local function getSmoothedVelocity(hrp)
     local current = hrp.Velocity
     if not velocityHistory[hrp] then
-        velocityHistory[hrp] = { current, current }
+        velocityHistory[hrp] = { current, current, current, current }
         accelerationHistory[hrp] = Vector3.new(0, 0, 0)
         return current
     end
     local h = velocityHistory[hrp]
-    
-    -- Calcula aceleração (mudança de velocidade)
-    local oldVel = h[2]
-    local accel = (current - oldVel)
-    accelerationHistory[hrp] = accel
-    
+
+    -- Aceleração: diferença entre amostra mais velha e atual
+    accelerationHistory[hrp] = current - h[1]
+
+    -- Desloca histórico
     h[1] = h[2]
-    h[2] = current
-    
+    h[2] = h[3]
+    h[3] = h[4]
+    h[4] = current
+
+    -- Média ponderada: h[1]*1 + h[2]*2 + h[3]*3 + h[4]*4  /  10
     return Vector3.new(
-        (h[1].X + h[2].X) * 0.5,
-        (h[1].Y + h[2].Y) * 0.5,
-        (h[1].Z + h[2].Z) * 0.5
+        (h[1].X + h[2].X*2 + h[3].X*3 + h[4].X*4) / W_TOTAL,
+        (h[1].Y + h[2].Y*2 + h[3].Y*3 + h[4].Y*4) / W_TOTAL,
+        (h[1].Z + h[2].Z*2 + h[3].Z*3 + h[4].Z*4) / W_TOTAL
     )
 end
 
@@ -301,256 +307,182 @@ local function getAcceleration(hrp)
     return accelerationHistory[hrp] or Vector3.new(0, 0, 0)
 end
 
-local function CalcularPredicaoRapida(alvo, minhaPos)
-    local alvoPos = alvo.Position
-    local alvoVel = getSmoothedVelocity(alvo)
-    local alvoAccel = getAcceleration(alvo) -- NOVO: detecta mudanças de direção
+-- Detecta padrão de movimento do alvo
+local function detectMovementPattern(hrp)
+    if not autoShotConfig.patternRecognition then return "unknown" end
+
+    local vel = hrp.Velocity
+    local velXZ = Vector2.new(vel.X, vel.Z).Magnitude
+
+    if not shotStats.movementPatterns[hrp] then
+        shotStats.movementPatterns[hrp] = { positions = {}, pattern = "unknown" }
+    end
+
+    local history = shotStats.movementPatterns[hrp]
+    table.insert(history.positions, hrp.Position)
+    if #history.positions > 10 then
+        table.remove(history.positions, 1)
+    end
+
+    if #history.positions < 5 then return "unknown" end
+
+    local changes = 0
+    local totalDist = 0
+    for i = 2, #history.positions do
+        local dir1 = (history.positions[i] - history.positions[i-1]).Unit
+        if i > 2 then
+            local dir2 = (history.positions[i-1] - history.positions[i-2]).Unit
+            local angle = math.acos(math.clamp(dir1:Dot(dir2), -1, 1))
+            if angle > math.rad(45) then changes = changes + 1 end
+        end
+        totalDist = totalDist + (history.positions[i] - history.positions[i-1]).Magnitude
+    end
+
+    local avgDist = totalDist / (#history.positions - 1)
+
+    if velXZ < 2 then
+        history.pattern = "stationary"
+    elseif changes >= 3 then
+        history.pattern = "zigzag"
+    elseif avgDist > 3 and changes < 2 then
+        history.pattern = "linear"
+    elseif changes >= 2 and avgDist < 3 then
+        history.pattern = "circling"
+    else
+        history.pattern = "erratic"
+    end
+
+    return history.pattern
+end
+
+-- Multiplica predição horizontal pelo padrão detectado
+local function getPatternAdjustment(pattern)
+    local adjustments = {
+        stationary = 0.3,
+        linear     = 1.0,
+        zigzag     = 1.3,
+        circling   = 1.2,
+        erratic    = 1.1,
+        unknown    = 1.0
+    }
+    return adjustments[pattern] or 1.0
+end
+
+-- alvoHRP: HumanoidRootPart (para velocidade/física)
+-- alvoAim: Head ou HRP (posição de onde apontar)
+local function CalcularPredicaoRapida(alvoHRP, alvoAim, minhaPos)
+    local alvoPos = alvoAim.Position        -- posição de onde apontar (Head)
+    local alvoVel = getSmoothedVelocity(alvoHRP)  -- física via HRP
+    local alvoAccel = getAcceleration(alvoHRP)
     local dist = (alvoPos - minhaPos).Magnitude
 
-    -- LeadTime base + compensação de ping MELHORADA
-    local leadTime = sheriffConfig.LeadTime
+    -- ── 1. TEMPO DE PING ────────────────────────────────────────────
+    local pingTime = 0
     if sheriffConfig.PingPrediction then
         local ping = getPing()
-        -- Compensação não-linear para pings altos
-        local pingCompensation = ping * 0.001 * sheriffConfig.PingSensitivity
-        if ping > 100 then
-            pingCompensation = pingCompensation * 1.2 -- Aumenta compensação para lag alto
-        elseif ping > 150 then
-            pingCompensation = pingCompensation * 1.35 -- Lag muito alto
-        end
-        leadTime = leadTime + pingCompensation
+        pingTime = ping * 0.001 * sheriffConfig.PingSensitivity
+        if ping > 150 then pingTime = pingTime * 1.35
+        elseif ping > 100 then pingTime = pingTime * 1.2 end
     end
 
-    -- Ajuste por distância MELHORADO
-    if dist <= sheriffConfig.MaxPredictionDistance then
-        -- Fórmula quadrática para distâncias longas (mais preciso)
-        local distFactor = (dist * 0.01 * sheriffConfig.DistanceFactor * 0.01)
-        if dist > 150 then
-            distFactor = distFactor * (1 + ((dist - 150) * 0.002)) -- Compensa queda de bala
-        end
-        if dist > 250 then
-            distFactor = distFactor * 1.1 -- Compensação extra para muito longe
-        end
-        leadTime = leadTime + distFactor
+    -- ── 2. TEMPO REAL DE VÔO DA BALA (solver 3D correto) ────────────
+    -- Equação: |relPos + vel*t|² = (BULLET_SPEED*t)²
+    -- Resolve: (vel·vel - speed²)t² + 2(relPos·vel)t + relPos·relPos = 0
+    local bulletFlightTime
+    local relPos = alvoPos - minhaPos
+    -- Usa velocidade 3D completa do alvo para o solver
+    local vel3 = Vector3.new(alvoVel.X, 0, alvoVel.Z) -- Y ignorado no solver (física separada)
+    local a3 = vel3:Dot(vel3) - (BULLET_SPEED * BULLET_SPEED)
+    local b3 = 2 * Vector3.new(relPos.X, 0, relPos.Z):Dot(vel3)
+    local c3 = Vector3.new(relPos.X, 0, relPos.Z):Dot(Vector3.new(relPos.X, 0, relPos.Z))
+    local disc = b3*b3 - 4*a3*c3
+
+    if math.abs(a3) < 1 then
+        -- Alvo quase parado: tempo = dist horizontal / speed
+        bulletFlightTime = math.sqrt(c3) / BULLET_SPEED
+    elseif disc >= 0 then
+        local t1 = (-b3 + math.sqrt(disc)) / (2*a3)
+        local t2 = (-b3 - math.sqrt(disc)) / (2*a3)
+        local t = (t1 > 0 and t2 > 0) and math.min(t1,t2) or math.max(t1,t2)
+        bulletFlightTime = (t > 0 and t < 3.0) and t or (dist / BULLET_SPEED)
+    else
+        bulletFlightTime = dist / BULLET_SPEED
     end
 
-    -- PREDIÇÃO COM ACELERAÇÃO (detecta mudança de direção)
-    local pred = alvoVel * leadTime
-    
-    -- Se o alvo está acelerando/virando, compensa
+    -- Tempo total = voo da bala + ping
+    local totalTime = bulletFlightTime + pingTime + sheriffConfig.LeadTime
+
+    -- ── 3. PREDIÇÃO HORIZONTAL (X, Z) ───────────────────────────────
+    -- Posição futura = vel*t + ½*accel*t² (cinemática simples)
     local accelMagnitude = alvoAccel.Magnitude
-    if accelMagnitude > 5 then -- Detecta strafe/virada brusca
-        -- Adiciona predição de aceleração: ½at²
-        local accelPred = alvoAccel * (0.5 * leadTime * leadTime)
-        pred = pred + accelPred
+    local horizAccel = Vector3.new(alvoAccel.X, 0, alvoAccel.Z)
+
+    local predX = alvoVel.X * totalTime
+    local predZ = alvoVel.Z * totalTime
+
+    -- Aceleração lateral só se realmente significativa (evita overshoot em mudanças bruscas)
+    if accelMagnitude > 8 then
+        predX = predX + horizAccel.X * (0.5 * totalTime * totalTime)
+        predZ = predZ + horizAccel.Z * (0.5 * totalTime * totalTime)
     end
-    
-    local divisor = (sheriffConfig.HorizontalDivisorMin + sheriffConfig.HorizontalDivisorMax) * 0.05
 
-    local predX = (pred.X * sheriffConfig.HorizontalMultiplier / divisor) + (sheriffConfig.XMultiplier * 10)
-    local predY = pred.Y * sheriffConfig.VerticalMultiplier
-    local predZ = (pred.Z * sheriffConfig.HorizontalMultiplier / divisor) + (sheriffConfig.ZMultiplier * 10)
+    -- Multiplica pelo HorizontalMultiplier do usuário (fine-tune)
+    predX = predX * sheriffConfig.HorizontalMultiplier + (sheriffConfig.XMultiplier * 10)
+    predZ = predZ * sheriffConfig.HorizontalMultiplier + (sheriffConfig.ZMultiplier * 10)
 
-    -- ANTI-SHAKE: Se velocidade é muito baixa mas aceleração alta = tremendo/parado
+    -- Anti-shake: alvo tremendo (micro-movimentos)
     local velMagnitude = alvoVel.Magnitude
     if velMagnitude < 3 and accelMagnitude > 2 then
-        -- Alvo está "tremendo" (pequenos movimentos), reduz predição
-        predX = predX * 0.5
-        predZ = predZ * 0.5
+        predX = predX * 0.4
+        predZ = predZ * 0.4
     end
 
-    -- Escala vertical por distância MELHORADA
-    if dist > 50 then
-        local vertScale = 1 + (dist * 0.01 * sheriffConfig.VerticalDistanceScale * 0.01)
-        -- Compensação extra para distâncias muito longas
-        if dist > 200 then
-            vertScale = vertScale * 1.15
-        end
-        if dist > 300 then
-            vertScale = vertScale * 1.25 -- Distância extrema
-        end
-        predY = predY * vertScale
+    -- Pattern recognition
+    if autoShotConfig.patternRecognition then
+        local pattern = detectMovementPattern(alvoHRP)
+        local patternMult = getPatternAdjustment(pattern)
+        predX = predX * patternMult
+        predZ = predZ * patternMult
     end
 
-    -- JUMP PREDICTION COMPLETAMENTE REFEITO (MUITO MELHOR!)
+    -- ── 4. PREDIÇÃO VERTICAL (Y) com física real ────────────────────
+    local predY = 0
+    local velY = alvoVel.Y
+    local gravity = 196.2 -- gravidade Roblox (studs/s²)
+
     if sheriffConfig.JumpPrediction then
-        local hum = alvo.Parent and alvo.Parent:FindFirstChild("Humanoid")
-        if hum then
-            local state = hum:GetState()
-            local velY = alvoVel.Y
-            local accelY = alvoAccel.Y
-            
-            -- Detecta se está pulando/caindo
-            if state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.Jumping or math.abs(velY) > 5 then
-                -- FÍSICA REAL DE QUEDA
-                local gravity = 196.2 -- Gravidade do Roblox
-                local timeInAir = leadTime
-                
-                -- Calcula posição Y com física real (equação de queda livre)
-                -- s = v₀t + ½gt²
-                local gravityOffset = 0.5 * gravity * (timeInAir * timeInAir)
-                
-                -- Se está subindo (jumping)
-                if velY > 0 then
-                    predY = predY + (velY * timeInAir) - gravityOffset
-                    
-                    -- NOVO: Detecta se está no início do pulo ou próximo do apex
-                    if accelY < -50 then -- Aceleração negativa = subindo mas desacelerando
-                        -- Próximo do apex (topo)
-                        predY = predY * 0.82 -- Ajuste empírico melhorado
-                    elseif accelY > -20 then
-                        -- Início do pulo (ainda acelerando)
-                        predY = predY * 0.95
-                    else
-                        -- Meio do pulo
-                        predY = predY * 0.88
-                    end
-                else
-                    -- Se está caindo
-                    predY = predY + (velY * timeInAir) - gravityOffset
-                    
-                    -- Compensação baseada na velocidade de queda
-                    if velY < -30 then
-                        predY = predY * 1.12 -- Queda rápida
-                    elseif velY < -50 then
-                        predY = predY * 1.18 -- Queda muito rápida
-                    end
-                end
-                
-                -- Ajuste baseado na distância (balas caem com distância)
-                if dist > 100 then
-                    local bulletDrop = dist * 0.015
-                    if dist > 200 then
-                        bulletDrop = bulletDrop * 1.2 -- Queda de bala aumenta com distância
-                    end
-                    predY = predY - bulletDrop
-                end
-            end
+        local hum = alvoHRP.Parent and alvoHRP.Parent:FindFirstChild("Humanoid")
+        local isAirborne = hum and (
+            hum:GetState() == Enum.HumanoidStateType.Freefall or
+            hum:GetState() == Enum.HumanoidStateType.Jumping or
+            math.abs(velY) > 3
+        )
+
+        if isAirborne then
+            -- Física real: s = v₀t - ½gt²   (gravidade é negativa em Roblox)
+            predY = (velY * totalTime) - (0.5 * gravity * totalTime * totalTime)
+        else
+            -- No chão: só compensa bullet drop por distância
+            predY = 0
         end
     end
-    
-    -- STRAFE DETECTION: Se movimento lateral é consistente, aumenta predição lateral
-    local horizontalVel = Vector2.new(alvoVel.X, alvoVel.Z).Magnitude
-    local horizontalAccel = Vector2.new(alvoAccel.X, alvoAccel.Z).Magnitude
-    
-    if horizontalVel > 10 and horizontalAccel < 5 then -- Strafe constante
-        -- Aumenta predição horizontal um pouco para compensar strafe
-        predX = predX * 1.05
-        predZ = predZ * 1.05
+
+    -- Bullet drop da própria bala (compensa gravidade na trajetória)
+    -- A bala do MM2 tem velocidade alta mas ainda cai um pouco
+    if dist > 80 then
+        local drop = (dist - 80) * 0.008 * sheriffConfig.VerticalDistanceScale
+        predY = predY - drop
     end
+
+    -- VerticalMultiplier do usuário como fine-tune
+    predY = predY * sheriffConfig.VerticalMultiplier
 
     return alvoPos + Vector3.new(predX, predY, predZ)
 end
 
 -- ==================== FUNÇÕES AVANÇADAS AUTO SHOT ====================
 
--- NOVO: Resolve equação balística real de intercepção
-local function solveBallisticIntercept(targetPos, targetVel, shooterPos)
-    if not autoShotConfig.ballisticSolver then
-        return targetPos -- Fallback
-    end
-    
-    -- Equação de intercepção balística
-    -- |bulletSpeed * t|² = |targetPos - shooterPos + targetVel * t|²
-    
-    local relPos = targetPos - shooterPos
-    local a = targetVel:Dot(targetVel) - (BULLET_SPEED * BULLET_SPEED)
-    local b = 2 * relPos:Dot(targetVel)
-    local c = relPos:Dot(relPos)
-    
-    -- Resolve equação quadrática: at² + bt + c = 0
-    local discriminant = b*b - 4*a*c
-    
-    if discriminant < 0 then
-        -- Sem solução real, usa predição simples
-        return targetPos + targetVel * (relPos.Magnitude / BULLET_SPEED)
-    end
-    
-    local t1 = (-b + math.sqrt(discriminant)) / (2*a)
-    local t2 = (-b - math.sqrt(discriminant)) / (2*a)
-    
-    -- Pega o menor tempo positivo
-    local t = math.min(t1, t2)
-    if t < 0 then t = math.max(t1, t2) end
-    if t < 0 then t = relPos.Magnitude / BULLET_SPEED end -- Fallback
-    
-    return targetPos + targetVel * t
-end
-
--- NOVO: Detecta padrão de movimento
-local function detectMovementPattern(hrp)
-    if not autoShotConfig.patternRecognition then return "unknown" end
-    
-    local vel = hrp.Velocity
-    local velXZ = Vector2.new(vel.X, vel.Z).Magnitude
-    
-    -- Analisa histórico
-    if not shotStats.movementPatterns[hrp] then
-        shotStats.movementPatterns[hrp] = {
-            positions = {},
-            pattern = "unknown"
-        }
-    end
-    
-    local history = shotStats.movementPatterns[hrp]
-    table.insert(history.positions, hrp.Position)
-    
-    -- Mantém apenas últimas 10 posições
-    if #history.positions > 10 then
-        table.remove(history.positions, 1)
-    end
-    
-    -- Precisa de pelo menos 5 posições para detectar padrão
-    if #history.positions < 5 then return "unknown" end
-    
-    -- Detecta padrões
-    local changes = 0
-    local totalDist = 0
-    
-    for i = 2, #history.positions do
-        local dir1 = (history.positions[i] - history.positions[i-1]).Unit
-        if i > 2 then
-            local dir2 = (history.positions[i-1] - history.positions[i-2]).Unit
-            local angle = math.acos(math.clamp(dir1:Dot(dir2), -1, 1))
-            if angle > math.rad(45) then -- Mudança de direção
-                changes = changes + 1
-            end
-        end
-        totalDist = totalDist + (history.positions[i] - history.positions[i-1]).Magnitude
-    end
-    
-    local avgDist = totalDist / (#history.positions - 1)
-    
-    -- Classifica padrão
-    if velXZ < 2 then
-        history.pattern = "stationary" -- Parado
-    elseif changes >= 3 then
-        history.pattern = "zigzag" -- Zig-zag
-    elseif avgDist > 3 and changes < 2 then
-        history.pattern = "linear" -- Linha reta
-    elseif changes >= 2 and avgDist < 3 then
-        history.pattern = "circling" -- Circulando
-    else
-        history.pattern = "erratic" -- Errático
-    end
-    
-    return history.pattern
-end
-
--- NOVO: Ajuste adaptativo baseado em padrão
-local function getPatternAdjustment(pattern)
-    -- Multiplica predição baseado no padrão detectado
-    local adjustments = {
-        stationary = 0.3,  -- Parado = menos predição
-        linear = 1.0,      -- Linha reta = predição normal
-        zigzag = 1.3,      -- Zig-zag = mais predição
-        circling = 1.2,    -- Circulando = predição moderada
-        erratic = 1.1,     -- Errático = pouco mais
-        unknown = 1.0      -- Desconhecido = normal
-    }
-    
-    return adjustments[pattern] or 1.0
-end
+-- (ballistic solver unificado dentro de CalcularPredicaoRapida)
 
 local function hasLineOfSight(fromPos, toPos)
     if not autoShotConfig.wallCheck then return true end
@@ -686,34 +618,86 @@ local function Atirar()
         local humAlvo = alvo.Parent and alvo.Parent:FindFirstChild("Humanoid")
         if not humAlvo or humAlvo.Health <= 0 then return end
 
+        -- Pega a Head do alvo (hitbox mais preciso no MM2)
+        local headAlvo = alvo.Parent:FindFirstChild("Head")
+        local alvoAimPos = headAlvo or alvo -- fallback para HRP se não tiver Head
+
         local head = char:FindFirstChild("Head")
         if not head then return end
 
         local dist = (alvo.Position - head.Position).Magnitude
         if dist > sheriffConfig.MaxPredictionDistance then return end
-        
+
         -- Verifica parede se ativado
         if autoShotConfig.wallCheck and not hasLineOfSight(head.Position, alvo.Position) then
             return
         end
 
-        -- Predição MELHORADA com física real
-        local posPredicao = CalcularPredicaoRapida(alvo, head.Position)
+        -- Função que executa o tiro (usada tanto direto quanto após apex)
+        local function executarTiro()
+            if not podeAtirar then return end
+            if not alvo or not alvo.Parent then return end
+            if not humAlvo or humAlvo.Health <= 0 then return end
 
-        -- Atirar imediatamente
-        evento:FireServer(CFrame.new(head.Position, posPredicao), CFrame.new(posPredicao))
-        
-        -- Atualiza estatísticas (background)
-        shotStats.totalShots = shotStats.totalShots + 1
-        shotStats.lastShotTime = tick()
-        shotStats.avgDistance = (shotStats.avgDistance + dist) / 2
+            local posPredicao = CalcularPredicaoRapida(alvo, alvoAimPos, head.Position)
 
-        -- Cooldown após atirar
-        podeAtirar = false
-        task.delay(delayTiro, function() podeAtirar = true end)
+            -- Se predição ficou longe demais (alvo mudou dir. bruscamente), mira na head atual
+            if (posPredicao - alvoAimPos.Position).Magnitude > 40 then
+                posPredicao = alvoAimPos.Position
+            end
 
-        if sheriffConfig.UnequipAfterShot then
-            task.delay(delayHolster > 0 and delayHolster or 0.05, DesequiparArmaRapido)
+            evento:FireServer(CFrame.new(head.Position, posPredicao), CFrame.new(posPredicao))
+
+            shotStats.totalShots = shotStats.totalShots + 1
+            shotStats.lastShotTime = tick()
+            shotStats.avgDistance = (shotStats.avgDistance + dist) / 2
+
+            podeAtirar = false
+            local adaptiveDelay
+            if dist < 50 then
+                adaptiveDelay = delayTiro * 0.7
+            elseif dist < 120 then
+                adaptiveDelay = delayTiro
+            elseif dist < 220 then
+                adaptiveDelay = delayTiro * 1.3
+            else
+                adaptiveDelay = delayTiro * 1.6
+            end
+            task.delay(adaptiveDelay, function() podeAtirar = true end)
+
+            if sheriffConfig.UnequipAfterShot then
+                task.delay(delayHolster > 0 and delayHolster or 0.05, DesequiparArmaRapido)
+            end
+        end
+
+        -- APEX DETECTION: se murder está no topo do pulo (velY ≈ 0, ainda no ar),
+        -- aguarda cair via Heartbeat e só então dispara — sem nenhum yield/bloqueio
+        local stateAlvo = humAlvo:GetState()
+        local velYAlvo = alvo.Velocity.Y
+        local noApex = (stateAlvo == Enum.HumanoidStateType.Freefall or stateAlvo == Enum.HumanoidStateType.Jumping)
+                       and math.abs(velYAlvo) < 8
+
+        if noApex then
+            -- Bloqueia novos tiros enquanto espera o apex resolver
+            podeAtirar = false
+            local apexConn
+            -- Timeout de 0.12s: se não cair, dispara do mesmo jeito
+            local timeoutHandle = task.delay(0.12, function()
+                if apexConn then apexConn:Disconnect(); apexConn = nil end
+                podeAtirar = true
+                executarTiro()
+            end)
+            apexConn = RunService.Heartbeat:Connect(function()
+                if not apexConn then return end
+                if alvo.Velocity.Y < -5 then
+                    apexConn:Disconnect(); apexConn = nil
+                    task.cancel(timeoutHandle)
+                    podeAtirar = true
+                    executarTiro()
+                end
+            end)
+        else
+            executarTiro()
         end
     end)
     
@@ -1123,9 +1107,14 @@ local function CreateESP(targetPlayer)
         label.TextStrokeTransparency = 0
         label.TextScaled = false
         
-        -- Loop de atualização de cores e visibilidade
+        -- Loop de atualização de cores e visibilidade (throttled: ~10x/s, não 60x/s)
         local updateConnection
-        updateConnection = RunService.RenderStepped:Connect(function()
+        local lastESPUpdate = 0
+        updateConnection = RunService.Heartbeat:Connect(function()
+            local now = tick()
+            if now - lastESPUpdate < 0.1 then return end
+            lastESPUpdate = now
+
             if not character or not character.Parent then
                 if updateConnection then
                     updateConnection:Disconnect()
@@ -1272,41 +1261,48 @@ end
 
 local gunESPConnection = nil
 
+local function applyGunESP(v)
+    if v.Name ~= "GunDrop" then return end
+    if not v:FindFirstChild("GunESP_Highlight") then
+        local highlight = Instance.new("Highlight")
+        highlight.Name = "GunESP_Highlight"
+        highlight.Parent = v
+        highlight.FillColor = Color3.fromRGB(255, 255, 0)
+        highlight.OutlineColor = Color3.new(1, 1, 1)
+        highlight.FillTransparency = 0.5
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    end
+    if not v:FindFirstChild("GunESP_Name") then
+        local billboard = Instance.new("BillboardGui")
+        billboard.Name = "GunESP_Name"
+        billboard.Parent = v
+        billboard.AlwaysOnTop = true
+        billboard.Size = UDim2.new(0, 100, 0, 50)
+        billboard.StudsOffset = Vector3.new(0, 2, 0)
+        local label = Instance.new("TextLabel")
+        label.Parent = billboard
+        label.BackgroundTransparency = 1
+        label.Size = UDim2.new(1, 0, 1, 0)
+        label.Text = "GUN"
+        label.TextColor3 = Color3.fromRGB(255, 255, 0)
+        label.TextStrokeTransparency = 0
+        label.TextSize = 14
+        label.Font = Enum.Font.SourceSansBold
+    end
+end
+
 local function enableGunESP()
     if gunESPConnection then return end
-    gunESPConnection = functions.createconnection("GunESP_Loop", "Heartbeat", function()
-        if not espConfig.gunEnabled then return end
-        for _, v in pairs(Workspace:GetDescendants()) do
-            if v.Name == "GunDrop" then
-                if not v:FindFirstChild("GunESP_Highlight") then
-                    local highlight = Instance.new("Highlight")
-                    highlight.Name = "GunESP_Highlight"
-                    highlight.Parent = v
-                    highlight.FillColor = Color3.fromRGB(255, 255, 0)
-                    highlight.OutlineColor = Color3.new(1, 1, 1)
-                    highlight.FillTransparency = 0.5
-                    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                end
-                if not v:FindFirstChild("GunESP_Name") then
-                    local billboard = Instance.new("BillboardGui")
-                    billboard.Name = "GunESP_Name"
-                    billboard.Parent = v
-                    billboard.AlwaysOnTop = true
-                    billboard.Size = UDim2.new(0, 100, 0, 50)
-                    billboard.StudsOffset = Vector3.new(0, 2, 0)
-                    local label = Instance.new("TextLabel")
-                    label.Parent = billboard
-                    label.BackgroundTransparency = 1
-                    label.Size = UDim2.new(1, 0, 1, 0)
-                    label.Text = "GUN"
-                    label.TextColor3 = Color3.fromRGB(255, 255, 0)
-                    label.TextStrokeTransparency = 0
-                    label.TextSize = 14
-                    label.Font = Enum.Font.SourceSansBold
-                end
-            end
+    -- Aplica nas armas já existentes
+    for _, v in pairs(Workspace:GetDescendants()) do
+        applyGunESP(v)
+    end
+    -- Detecta novas armas via evento (sem loop pesado)
+    gunESPConnection = functions.createconnection("GunESP_Loop", Workspace.DescendantAdded, function(v)
+        if espConfig.gunEnabled then
+            applyGunESP(v)
         end
-    end, 1)
+    end)
 end
 
 local function disableGunESP()
@@ -1618,18 +1614,6 @@ do
         Rounding = 2,
         Callback = function(value)
             sheriffConfig.LeadTime = value
-        end
-    })
-
-    sheriffTab:AddSlider("DistanceFactor", {
-        Title = "Distance Factor",
-        Description = "Distance-based prediction adjustment",
-        Default = 5.00,
-        Min = 1,
-        Max = 30,
-        Rounding = 2,
-        Callback = function(value)
-            sheriffConfig.DistanceFactor = value
         end
     })
 
