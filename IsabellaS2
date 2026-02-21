@@ -172,81 +172,128 @@ local function DesequiparArmaRapido()
     end
 end
 
--- Weighted smoothing com 4 amostras: pesos 1-2-3-4 (mais recente = mais influência)
--- Reduz jitter de rede mas reage rápido a mudanças bruscas de direção
-local W_TOTAL = 10 -- 1+2+3+4
+-- ── SISTEMA DE VELOCIDADE COM TIMESTAMP ─────────────────────────────
+-- Mantém histórico de (velocidade, tempo) para:
+-- 1. Calcular aceleração via regressão linear (muito mais estável que derivada entre 2 pontos)
+-- 2. Saber quanto tempo passou desde a última replicação (para extrapolar posição)
+-- Tamanho do buffer: 6 amostras (~100ms a 60fps)
+local VEL_BUFFER_SIZE = 6
+local W_TOTAL = 21 -- 1+2+3+4+5+6
 
--- Limiar de mudança brusca de direção (em graus convertido para dot product)
--- 55° = murder virou mais de 55 graus desde a última amostra → zigzag detectado
 local DIRECTION_CHANGE_THRESHOLD = math.cos(math.rad(55))
 
+-- Cada entrada do histórico: { vel=Vector3, t=number }
 local function getSmoothedVelocity(hrp)
     local current = hrp.Velocity
+    local now     = tick()
+
     if not velocityHistory[hrp] then
-        velocityHistory[hrp] = { current, current, current, current }
+        -- Inicializa buffer com a velocidade atual em tempos fictícios
+        velocityHistory[hrp] = {}
+        for i = 1, VEL_BUFFER_SIZE do
+            velocityHistory[hrp][i] = { vel = current, t = now - (VEL_BUFFER_SIZE - i) * 0.016 }
+        end
         accelerationHistory[hrp] = Vector3.new(0, 0, 0)
-        return current, false -- (velocidade, houveMudancaBrusca)
+        return current, false
     end
+
     local h = velocityHistory[hrp]
 
-    -- Aceleração: diferença entre amostra mais velha e atual
-    accelerationHistory[hrp] = current - h[1]
-
-    -- Detecta mudança brusca de direção no plano horizontal (XZ)
-    -- Compara direção atual com direção da última amostra
+    -- Detecta mudança brusca de direção (zigzag) comparando atual com última amostra
     local dirChanged = false
-    local currentXZ = Vector2.new(current.X, current.Z)
-    local lastXZ    = Vector2.new(h[4].X, h[4].Z)
-    local currentMag = currentXZ.Magnitude
+    local lastVel    = h[VEL_BUFFER_SIZE].vel
+    local curXZ      = Vector2.new(current.X, current.Z)
+    local lastXZ     = Vector2.new(lastVel.X, lastVel.Z)
+    local curMag     = curXZ.Magnitude
     local lastMag    = lastXZ.Magnitude
 
-    if currentMag > 2 and lastMag > 2 then
-        local dot = (currentXZ / currentMag):Dot(lastXZ / lastMag)
+    if curMag > 2 and lastMag > 2 then
+        local dot = (curXZ / curMag):Dot(lastXZ / lastMag)
         if dot < DIRECTION_CHANGE_THRESHOLD then
-            -- Mudança brusca detectada: reseta histórico com velocidade atual
-            -- Assim o smoothing não carrega a direção antiga
-            velocityHistory[hrp] = { current, current, current, current }
+            -- Reseta buffer inteiro com velocidade atual
+            for i = 1, VEL_BUFFER_SIZE do
+                h[i] = { vel = current, t = now - (VEL_BUFFER_SIZE - i) * 0.016 }
+            end
             accelerationHistory[hrp] = Vector3.new(0, 0, 0)
             return current, true
         end
     end
 
-    -- Desloca histórico
-    h[1] = h[2]
-    h[2] = h[3]
-    h[3] = h[4]
-    h[4] = current
+    -- Desloca buffer: remove [1] (mais velho), adiciona novo no [VEL_BUFFER_SIZE]
+    for i = 1, VEL_BUFFER_SIZE - 1 do
+        h[i] = h[i + 1]
+    end
+    h[VEL_BUFFER_SIZE] = { vel = current, t = now }
 
-    -- Média ponderada: h[1]*1 + h[2]*2 + h[3]*3 + h[4]*4  /  10
-    return Vector3.new(
-        (h[1].X + h[2].X*2 + h[3].X*3 + h[4].X*4) / W_TOTAL,
-        (h[1].Y + h[2].Y*2 + h[3].Y*3 + h[4].Y*4) / W_TOTAL,
-        (h[1].Z + h[2].Z*2 + h[3].Z*3 + h[4].Z*4) / W_TOTAL
-    ), false
+    -- ── Aceleração via regressão linear no tempo ──────────────────────
+    -- Em vez de vel[n] - vel[n-1] (ruidoso), faz least-squares sobre todas as amostras.
+    -- Resultado: tendência real de variação de velocidade, muito menos sensível a spikes.
+    local sumT, sumVx, sumVz = 0, 0, 0
+    local sumT2, sumTVx, sumTVz = 0, 0, 0
+    local t0 = h[1].t  -- normaliza tempo relativo à amostra mais antiga
+    for i = 1, VEL_BUFFER_SIZE do
+        local dt  = h[i].t - t0
+        local vx  = h[i].vel.X
+        local vz  = h[i].vel.Z
+        sumT   = sumT   + dt
+        sumVx  = sumVx  + vx
+        sumVz  = sumVz  + vz
+        sumT2  = sumT2  + dt * dt
+        sumTVx = sumTVx + dt * vx
+        sumTVz = sumTVz + dt * vz
+    end
+    local n    = VEL_BUFFER_SIZE
+    local denom = n * sumT2 - sumT * sumT
+    local accelX, accelZ = 0, 0
+    if math.abs(denom) > 1e-6 then
+        accelX = (n * sumTVx - sumT * sumVx) / denom
+        accelZ = (n * sumTVz - sumT * sumVz) / denom
+    end
+    accelerationHistory[hrp] = Vector3.new(accelX, 0, accelZ)
+
+    -- Velocidade suavizada: média ponderada 1-2-3-4-5-6 (mais recente = mais peso)
+    local sv = Vector3.new(0, 0, 0)
+    for i = 1, VEL_BUFFER_SIZE do
+        sv = sv + h[i].vel * i
+    end
+    return sv / W_TOTAL, false
 end
 
 local function getAcceleration(hrp)
     return accelerationHistory[hrp] or Vector3.new(0, 0, 0)
 end
 
+-- Retorna o timestamp da amostra mais recente do buffer (para extrapolação)
+local function getLastReplicationTime(hrp)
+    local h = velocityHistory[hrp]
+    if not h then return tick() end
+    return h[VEL_BUFFER_SIZE].t
+end
+
 -- alvoHRP: HumanoidRootPart (para velocidade/física)
 -- alvoAim: Head ou HRP (posição de onde apontar)
 local function CalcularPredicaoRapida(alvoHRP, alvoAim, minhaPos)
-    -- Guarda: se alvo sumiu entre o agendamento e a execução, retorna nil
     if not alvoHRP or not alvoHRP.Parent then return nil end
     if not alvoAim or not alvoAim.Parent then return nil end
 
-    local alvoPos       = alvoAim.Position
-    local alvoVelRaw    = alvoHRP.Velocity
+    local alvoVelRaw                = alvoHRP.Velocity
     local alvoVelSmooth, dirChanged = getSmoothedVelocity(alvoHRP)
-    local alvoAccel     = getAcceleration(alvoHRP)
-    local dist          = (alvoPos - minhaPos).Magnitude
+    local alvoAccel                 = getAcceleration(alvoHRP)
 
-    -- Se houve mudança brusca de direção (zigzag), usa raw para tudo
-    -- Senão usa suavizada (menos jitter em movimento reto/constante)
-    local velParaOffset = dirChanged and alvoVelRaw or alvoVelSmooth
+    -- Velocidade unica e consistente para solver + predicao final
+    local vel = dirChanged and alvoVelRaw or alvoVelSmooth
 
-    -- ── 1. COMPENSAÇÃO DE PING ───────────────────────────────────────
+    -- EXTRPOLACAO: usa HRP (nao Head) para extrapolar, depois reconstroi Head
+    -- Head tem offset de animacao; extrapolar Head com velocidade do HRP cria desvio
+    local lastRepTime    = getLastReplicationTime(alvoHRP)
+    local repLag         = math.min(tick() - lastRepTime, 0.05)
+    local hrpExtrapolado = alvoHRP.Position + alvoVelRaw * repLag
+    local headOffset     = alvoAim.Position - alvoHRP.Position
+    local alvoPos        = hrpExtrapolado + headOffset
+
+    local dist = (alvoPos - minhaPos).Magnitude
+
+    -- PING
     local pingTime = 0
     if sheriffConfig.PingPrediction then
         local ping = getPing()
@@ -255,128 +302,108 @@ local function CalcularPredicaoRapida(alvoHRP, alvoAim, minhaPos)
         elseif ping > 100 then pingTime = pingTime * 1.2 end
     end
 
-    -- ── 2. SOLVER ITERATIVO MELHORADO ────────────────────────────────
-    -- Melhorias vs versão anterior:
-    -- 1. Inclui aceleração horizontal (vel*t + w*½*accel*t²)
-    -- 2. Para quando converge (erro < 0.08 studs) em vez de iterar sempre 4x
-    -- 3. Peso da aceleração decresce a cada iteração (0.50→0.25):
-    --    evita oscilação quando aceleração é ruidosa (derivada numérica)
-    -- 4. Máximo 8 iterações como segurança
-    -- Resultado: média 2-3 iterações, erro < 0.12 studs em todos os cenários
-    local CONV_STUDS = 0.08  -- para quando delta entre iterações < 0.08 studs
-    local horizDist = Vector2.new(alvoPos.X - minhaPos.X, alvoPos.Z - minhaPos.Z).Magnitude
-    local t = horizDist / BULLET_SPEED
+    -- SOLVER ITERATIVO: w_conv guardado para reusar na posicao final
+    -- garante que o peso de aceleracao e identico entre solver e posicao final
+    local CONV_STUDS = 0.08
+    local horizDist  = Vector2.new(alvoPos.X - minhaPos.X, alvoPos.Z - minhaPos.Z).Magnitude
+    local t          = horizDist / BULLET_SPEED
+    local w_conv     = 0.50
 
-    for i = 0, 7 do  -- máximo 8 iterações
-        -- Peso da aceleração: começa em 0.5 e decresce para 0.25
-        -- 0.5 (não 1.0) porque aceleração é derivada numérica e tende a ser ruidosa
-        local w = math.max(0.25, 0.50 - i * 0.03)
-
-        local futureX = alvoPos.X + alvoVelRaw.X * t + w * alvoAccel.X * t * t
-        local futureZ = alvoPos.Z + alvoVelRaw.Z * t + w * alvoAccel.Z * t * t
-        local newHorizDist = Vector2.new(futureX - minhaPos.X, futureZ - minhaPos.Z).Magnitude
-        local t_new = newHorizDist / BULLET_SPEED
-
-        -- Critério de convergência: diferença < 0.08 studs
+    for i = 0, 7 do
+        local w       = math.max(0.25, 0.50 - i * 0.03)
+        local futureX = alvoPos.X + vel.X * t + w * alvoAccel.X * t * t
+        local futureZ = alvoPos.Z + vel.Z * t + w * alvoAccel.Z * t * t
+        local t_new   = Vector2.new(futureX - minhaPos.X, futureZ - minhaPos.Z).Magnitude / BULLET_SPEED
         if math.abs(t_new - t) * BULLET_SPEED < CONV_STUDS then
+            w_conv = w
             t = t_new
             break
         end
+        w_conv = w
         t = t_new
     end
 
     local totalTime = t + pingTime + sheriffConfig.LeadTime
 
-    -- ── 3. PREDIÇÃO HORIZONTAL (X, Z) ───────────────────────────────
-    local predX = velParaOffset.X * totalTime
-    local predZ = velParaOffset.Z * totalTime
+    -- POSICAO FINAL XZ: usa w_conv da iteracao que convergiu (consistente com solver)
+    local finalX = alvoPos.X + vel.X * totalTime + w_conv * alvoAccel.X * totalTime * totalTime
+    local finalZ = alvoPos.Z + vel.Z * totalTime + w_conv * alvoAccel.Z * totalTime * totalTime
 
-    local accelMag = alvoAccel.Magnitude
-    if accelMag > 8 then
-        predX = predX + alvoAccel.X * (0.5 * totalTime * totalTime)
-        predZ = predZ + alvoAccel.Z * (0.5 * totalTime * totalTime)
+    -- Anti-shake: alvo quase parado com ruido de aceleracao
+    if alvoVelRaw.Magnitude < 3 and alvoAccel.Magnitude > 2 then
+        finalX = alvoPos.X + vel.X * totalTime * 0.4
+        finalZ = alvoPos.Z + vel.Z * totalTime * 0.4
     end
 
-    predX = predX * sheriffConfig.HorizontalMultiplier + (sheriffConfig.XMultiplier * 10)
-    predZ = predZ * sheriffConfig.HorizontalMultiplier + (sheriffConfig.ZMultiplier * 10)
+    -- Fine-tune do usuario aplicado no delta, nao na posicao absoluta
+    local deltaX = (finalX - alvoPos.X) * sheriffConfig.HorizontalMultiplier + (sheriffConfig.XMultiplier * 10)
+    local deltaZ = (finalZ - alvoPos.Z) * sheriffConfig.HorizontalMultiplier + (sheriffConfig.ZMultiplier * 10)
 
-    if alvoVelRaw.Magnitude < 3 and accelMag > 2 then
-        predX = predX * 0.4
-        predZ = predZ * 0.4
-    end
-
-    -- ── 4. PREDIÇÃO VERTICAL (Y) ────────────────────────────────────
-    -- predY e bulletDrop são mantidos SEPARADOS intencionalmente:
-    -- predY = offset de pulo (física real, só quando no ar)
-    -- predY e bulletDrop mantidos SEPARADOS:
-    -- predY = offset de pulo com detecção de pouso
-    -- bulletDrop = queda da bala
-    local predY   = 0
-    local velY    = velParaOffset.Y
+    -- VERTICAL
+    local deltaY  = 0
+    local velY    = vel.Y
     local gravity = 196.2
 
     if sheriffConfig.JumpPrediction then
-        local hum = alvoHRP.Parent and alvoHRP.Parent:FindFirstChild("Humanoid")
-        local state = hum and hum:GetState()
+        local hum        = alvoHRP.Parent and alvoHRP.Parent:FindFirstChild("Humanoid")
+        local state      = hum and hum:GetState()
         local isAirborne = state == Enum.HumanoidStateType.Freefall
                         or state == Enum.HumanoidStateType.Jumping
 
         if isAirborne then
-            -- Detecta distância ao chão via raycast para baixo do HRP do murder
-            -- Isso permite saber se o murder vai pousar antes da bala chegar
             local rayParams = RaycastParams.new()
             rayParams.FilterType = Enum.RaycastFilterType.Blacklist
             rayParams.FilterDescendantsInstances = { alvoHRP.Parent }
-            local rayResult = workspace:Raycast(
-                alvoHRP.Position,
-                Vector3.new(0, -50, 0),
-                rayParams
-            )
+            local rayResult = workspace:Raycast(alvoHRP.Position, Vector3.new(0, -50, 0), rayParams)
             local groundDist = rayResult and (alvoHRP.Position.Y - rayResult.Position.Y) or 999
 
-            -- Calcula quando o murder vai pousar:
-            -- velY*t - 0.5*g*t² = -groundDist  →  0.5g*t² - velY*t - groundDist = 0
+            -- Altura da Head acima do chao quando pousado
+            -- = offset atual Head-HRP + altura do HRP acima do chao (~3 studs)
+            local headAboveGround = headOffset.Y + 3
+
             local tPouso = 999
-            if velY < 0 then  -- só calcula se estiver caindo
+            if velY < 0 then
                 local a_eq = 0.5 * gravity
                 local b_eq = -velY
                 local c_eq = -groundDist
-                local disc  = b_eq*b_eq - 4*a_eq*c_eq
+                local disc  = b_eq * b_eq - 4 * a_eq * c_eq
                 if disc >= 0 then
-                    local r1 = (-b_eq + math.sqrt(disc)) / (2*a_eq)
-                    local r2 = (-b_eq - math.sqrt(disc)) / (2*a_eq)
-                    -- Pega a menor raiz positiva
-                    if r1 > 0 and r2 > 0 then
-                        tPouso = math.min(r1, r2)
-                    elseif r1 > 0 then
-                        tPouso = r1
-                    elseif r2 > 0 then
-                        tPouso = r2
-                    end
+                    local r1 = (-b_eq + math.sqrt(disc)) / (2 * a_eq)
+                    local r2 = (-b_eq - math.sqrt(disc)) / (2 * a_eq)
+                    if r1 > 0 and r2 > 0 then tPouso = math.min(r1, r2)
+                    elseif r1 > 0 then tPouso = r1
+                    elseif r2 > 0 then tPouso = r2 end
                 end
             end
 
             if tPouso < totalTime then
-                -- Murder pousa ANTES da bala chegar
-                -- Usa a posição de pouso (chão) em vez de continuar queda livre
-                predY = -groundDist
+                -- Pousa antes: mira na Head na posicao de pouso
+                -- Y do chao + headAboveGround - Y atual da Head
+                -- Se raycast falhou (groundDist=999), nao usar posicao de pouso
+                -- pois groundY seria absurdamente negativo
+                if rayResult then
+                    local groundY = rayResult.Position.Y
+                    deltaY = (groundY + headAboveGround) - alvoPos.Y
+                else
+                    -- Sem chao detectado: usa fisica normal (nao pousa)
+                    deltaY = (velY * totalTime) - (0.5 * gravity * totalTime * totalTime)
+                end
             else
-                -- Murder ainda está no ar quando a bala chega: física normal
-                predY = (velY * totalTime) - (0.5 * gravity * totalTime * totalTime)
+                deltaY = (velY * totalTime) - (0.5 * gravity * totalTime * totalTime)
             end
 
-            predY = predY * sheriffConfig.VerticalMultiplier
+            deltaY = deltaY * sheriffConfig.VerticalMultiplier
         end
     end
 
-    -- Bullet drop da bala: separado do pulo, não multiplicado por VerticalMultiplier
-    local bulletDrop = 0
+    -- Bullet drop separado, nao afetado por VerticalMultiplier
     if dist > 80 then
-        bulletDrop = (dist - 80) * 0.008 * sheriffConfig.VerticalDistanceScale
+        deltaY = deltaY - (dist - 80) * 0.008 * sheriffConfig.VerticalDistanceScale
     end
 
-    return alvoPos + Vector3.new(predX, predY - bulletDrop, predZ)
+    return Vector3.new(alvoPos.X + deltaX, alvoPos.Y + deltaY, alvoPos.Z + deltaZ)
 end
+
 
 -- ==================== FUNÇÕES AVANÇADAS AUTO SHOT ====================
 
@@ -471,135 +498,135 @@ end
 
 -- ==================== AUTO SHOT MELHORADO ====================
 
+local equipAttempts = 0  -- previne loop infinito de equip
+
 local function Atirar()
-    -- Proteção contra múltiplas chamadas
     if not podeAtirar then return end
 
-    -- Usa pcall para proteger contra erros quando o personagem está resetando
-    local success, errorMsg = pcall(function()
-        local char = game.Players.LocalPlayer.Character
-        if not char or not char.Parent then return end
+    local char = game.Players.LocalPlayer.Character
+    if not char or not char.Parent then return end
 
-        local hum = char:FindFirstChild("Humanoid")
-        if not hum or hum.Health <= 0 then return end
+    local hum = char:FindFirstChild("Humanoid")
+    if not hum or hum.Health <= 0 then return end
 
-        local head = char:FindFirstChild("Head")
-        if not head then return end
+    local head = char:FindFirstChild("Head")
+    if not head then return end
 
-        -- ── 1. ACHA O ALVO PRIMEIRO ─────────────────────────────────
-        local alvo = AcharMelhorAlvo()
+    -- ── 1. ACHA O ALVO ──────────────────────────────────────────────
+    local alvo = AcharMelhorAlvo()
+    if not alvo or not alvo.Parent then return end
+
+    local humAlvo = alvo.Parent:FindFirstChild("Humanoid")
+    if not humAlvo or humAlvo.Health <= 0 then return end
+
+    local headAlvo   = alvo.Parent:FindFirstChild("Head")
+    local alvoAimPos = headAlvo or alvo
+
+    -- dist calculada da Head do alvo (igual ao alvo de mira real)
+    -- antes usava HRP — causava rejeitar alvo válido por +3 studs
+    local dist = (alvoAimPos.Position - head.Position).Magnitude
+    if dist > sheriffConfig.MaxPredictionDistance then return end
+
+    -- ── 2. WALL CHECK ────────────────────────────────────────────────
+    if autoShotConfig.wallCheck and not hasLineOfSight(head.Position, alvo.Position) then
+        return
+    end
+
+    -- ── 3. EQUIPA A ARMA (máx 3 tentativas — evita loop infinito) ───
+    local arma = char:FindFirstChild("Gun")
+    if not arma then
+        if equipAttempts >= 3 then
+            equipAttempts = 0
+            return
+        end
+        local gunInBackpack = game.Players.LocalPlayer.Backpack:FindFirstChild("Gun")
+        if not gunInBackpack then equipAttempts = 0; return end
+
+        equipAttempts = equipAttempts + 1
+        task.spawn(function()
+            hum:EquipTool(gunInBackpack)
+            task.wait(0.05)
+            if podeAtirar then Atirar() end
+        end)
+        return
+    end
+    equipAttempts = 0
+
+    local evento = arma:FindFirstChild("Shoot")
+    if not evento then return end
+
+    -- ── 4. EXECUTA O TIRO ────────────────────────────────────────────
+    local function executarTiro()
+        if not podeAtirar then return end
         if not alvo or not alvo.Parent then return end
-
-        local humAlvo = alvo.Parent and alvo.Parent:FindFirstChild("Humanoid")
         if not humAlvo or humAlvo.Health <= 0 then return end
+        if not alvoAimPos or not alvoAimPos.Parent then return end
 
-        -- Head do alvo para mira mais precisa (fallback para HRP)
-        local headAlvo = alvo.Parent:FindFirstChild("Head")
-        local alvoAimPos = headAlvo or alvo
+        local posPredicao = CalcularPredicaoRapida(alvo, alvoAimPos, head.Position)
+        if not posPredicao then return end
 
-        local dist = (alvo.Position - head.Position).Magnitude
-        if dist > sheriffConfig.MaxPredictionDistance then return end
-
-        -- ── 2. WALL CHECK ANTES DE EQUIPAR ──────────────────────────
-        -- Se wall check ligado e alvo atrás de parede: não equipa, não faz nada
-        if autoShotConfig.wallCheck and not hasLineOfSight(head.Position, alvo.Position) then
-            return
+        if (posPredicao - alvoAimPos.Position).Magnitude > 40 then
+            posPredicao = alvoAimPos.Position
         end
 
-        -- ── 3. SÓ AGORA VERIFICA/EQUIPA A ARMA ─────────────────────
-        local arma = char:FindFirstChild("Gun")
-        if not arma then
-            local armaBackpack = game.Players.LocalPlayer.Backpack
-            if not armaBackpack then return end
+        evento:FireServer(CFrame.new(head.Position, posPredicao), CFrame.new(posPredicao))
 
-            local gunInBackpack = armaBackpack:FindFirstChild("Gun")
-            if not gunInBackpack then return end
+        podeAtirar = false
 
-            -- Equipa assíncrono e tenta atirar novamente após equipar
-            task.spawn(function()
-                hum:EquipTool(gunInBackpack)
-                task.wait(0.05)
-                if podeAtirar then
-                    Atirar()
-                end
-            end)
-            return
+        -- dist recalculada no momento real do tiro (alvo pode ter se movido durante apex)
+        local distAtual = (alvoAimPos.Position - head.Position).Magnitude
+        local adaptiveDelay
+        if distAtual < 50 then
+            adaptiveDelay = delayTiro * 0.7
+        elseif distAtual < 120 then
+            adaptiveDelay = delayTiro
+        elseif distAtual < 220 then
+            adaptiveDelay = delayTiro * 1.3
+        else
+            adaptiveDelay = delayTiro * 1.6
         end
+        task.delay(adaptiveDelay, function() podeAtirar = true end)
 
-        local evento = arma:FindFirstChild("Shoot")
-        if not evento then return end
-
-        -- Função que executa o tiro (usada tanto direto quanto após apex)
-        local function executarTiro()
-            if not podeAtirar then return end
-            if not alvo or not alvo.Parent then return end
-            if not humAlvo or humAlvo.Health <= 0 then return end
-            -- Re-valida alvoAimPos pois pode ter sumido durante o apex delay
-            if not alvoAimPos or not alvoAimPos.Parent then return end
-
-            local posPredicao = CalcularPredicaoRapida(alvo, alvoAimPos, head.Position)
-
-            -- Se predição retornou nil (alvo sumiu dentro da função) ou ficou longe demais
-            if not posPredicao then return end
-            if (posPredicao - alvoAimPos.Position).Magnitude > 40 then
-                posPredicao = alvoAimPos.Position
-            end
-
-            evento:FireServer(CFrame.new(head.Position, posPredicao), CFrame.new(posPredicao))
-
-            podeAtirar = false
-            local adaptiveDelay
-            if dist < 50 then
-                adaptiveDelay = delayTiro * 0.7
-            elseif dist < 120 then
-                adaptiveDelay = delayTiro
-            elseif dist < 220 then
-                adaptiveDelay = delayTiro * 1.3
-            else
-                adaptiveDelay = delayTiro * 1.6
-            end
-            task.delay(adaptiveDelay, function() podeAtirar = true end)
-
-            if sheriffConfig.UnequipAfterShot then
-                task.delay(delayHolster > 0 and delayHolster or 0.05, DesequiparArmaRapido)
-            end
+        if sheriffConfig.UnequipAfterShot then
+            task.delay(delayHolster > 0 and delayHolster or 0.05, DesequiparArmaRapido)
         end
+    end
 
-        -- APEX DETECTION: se murder está no topo do pulo (velY ≈ 0, ainda no ar),
-        -- aguarda cair via Heartbeat e só então dispara — sem nenhum yield/bloqueio
-        local stateAlvo = humAlvo:GetState()
-        local velYAlvo = alvo.Velocity.Y
-        local noApex = (stateAlvo == Enum.HumanoidStateType.Freefall or stateAlvo == Enum.HumanoidStateType.Jumping)
-                       and math.abs(velYAlvo) < 8
+    -- ── 5. APEX DETECTION ────────────────────────────────────────────
+    local stateAlvo = humAlvo:GetState()
+    local velYAlvo  = alvo.Velocity.Y
+    local noApex    = (stateAlvo == Enum.HumanoidStateType.Freefall
+                    or stateAlvo == Enum.HumanoidStateType.Jumping)
+                   and math.abs(velYAlvo) < 8
 
-        if noApex then
-            -- Bloqueia novos tiros enquanto espera o apex resolver
-            podeAtirar = false
-            local apexConn
-            -- Timeout de 0.12s: se não cair, dispara do mesmo jeito
-            local timeoutHandle = task.delay(0.12, function()
-                if apexConn then apexConn:Disconnect(); apexConn = nil end
+    if noApex then
+        podeAtirar = false
+        local apexConn
+        -- Timeout garante que podeAtirar SEMPRE volta para true
+        -- Antes: se apexConn falhasse, podeAtirar ficava false para sempre
+        local timeoutHandle = task.delay(0.12, function()
+            if apexConn then apexConn:Disconnect(); apexConn = nil end
+            podeAtirar = true
+            executarTiro()
+        end)
+        apexConn = game:GetService("RunService").Heartbeat:Connect(function()
+            if not apexConn then return end
+            -- Alvo sumiu durante espera: libera sem atirar
+            if not alvo or not alvo.Parent then
+                apexConn:Disconnect(); apexConn = nil
+                task.cancel(timeoutHandle)
+                podeAtirar = true
+                return
+            end
+            if alvo.Velocity.Y < -5 then
+                apexConn:Disconnect(); apexConn = nil
+                task.cancel(timeoutHandle)
                 podeAtirar = true
                 executarTiro()
-            end)
-            apexConn = game:GetService("RunService").Heartbeat:Connect(function()
-                if not apexConn then return end
-                if alvo.Velocity.Y < -5 then
-                    apexConn:Disconnect(); apexConn = nil
-                    task.cancel(timeoutHandle)
-                    podeAtirar = true
-                    executarTiro()
-                end
-            end)
-        else
-            executarTiro()
-        end
-    end)
-    
-    -- Se houver erro, reseta o estado de podeAtirar para não travar
-    if not success then
-        podeAtirar = true
-        warn("Auto Shot Error:", errorMsg)
+            end
+        end)
+    else
+        executarTiro()
     end
 end
 
@@ -894,11 +921,15 @@ local function startHitbox()
         end
     end
     
-    -- Loop de manutenção (mantém HRP expandido)
+    -- Loop de manutenção throttled: 10x/s em vez de 60x/s
+    -- Rodar updateAllHitboxes todo frame causava travamentos (GetPlayers + iteração a 60fps)
+    local lastHitboxUpdate = 0
     hitboxConnections.heartbeat = game:GetService("RunService").Heartbeat:Connect(function()
-        if hitboxConfig.enabled then
-            updateAllHitboxes()
-        end
+        if not hitboxConfig.enabled then return end
+        local now = tick()
+        if now - lastHitboxUpdate < 0.1 then return end
+        lastHitboxUpdate = now
+        updateAllHitboxes()
     end)
     
     -- Cleanup quando jogador sai
@@ -1312,6 +1343,27 @@ local function setJump(value)
             humanoid.JumpPower = value
         end
     end
+end
+
+-- Monitora quando o jogo reseta WalkSpeed/JumpPower (ex: MM2 reseta ao puxar faca)
+-- e reaplica imediatamente os valores configurados
+local speedWatchConn = nil
+local jumpWatchConn  = nil
+
+local function hookHumanoidStats(humanoid)
+    if speedWatchConn then speedWatchConn:Disconnect() end
+    if jumpWatchConn  then jumpWatchConn:Disconnect()  end
+
+    speedWatchConn = humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+        if MY_SPEED ~= 16 and humanoid.WalkSpeed ~= MY_SPEED then
+            humanoid.WalkSpeed = MY_SPEED
+        end
+    end)
+    jumpWatchConn = humanoid:GetPropertyChangedSignal("JumpPower"):Connect(function()
+        if MY_JUMP ~= 50 and humanoid.JumpPower ~= MY_JUMP then
+            humanoid.JumpPower = MY_JUMP
+        end
+    end)
 end
 
 -- ==================== ANTI-AFK ====================
@@ -1833,6 +1885,8 @@ game.Players.LocalPlayer.CharacterAdded:Connect(function(character)
         if MY_JUMP ~= 50 then
             humanoid.JumpPower = MY_JUMP
         end
+        -- Monitora resets do jogo (ex: MM2 reseta WalkSpeed ao puxar faca)
+        hookHumanoidStats(humanoid)
     end
     
     -- Recria botão se estiver habilitado
@@ -1844,6 +1898,13 @@ end)
 
 -- Garante que o estado inicial está correto
 podeAtirar = true
+
+-- Hook inicial: se o personagem já existe quando o script carrega
+local _initChar = game.Players.LocalPlayer.Character
+if _initChar then
+    local _initHum = _initChar:FindFirstChild("Humanoid")
+    if _initHum then hookHumanoidStats(_initHum) end
+end
 
 -- SaveManager e InterfaceManager
 GUI.SaveManager:SetFolder("moon")
