@@ -875,8 +875,8 @@ local function AtualizarTamanhoBotao()
     end
 end
 
--- ==================== HITBOX SYSTEM (NOVO - DO ZERO) ====================
-
+-- ==================== HITBOX SYSTEM ====================
+-- Abordagem: Part SEPARADA no workspace (não modifica o HRP).
 local hitboxParts = {}
 local hitboxConnections = {}
 local originalSizes = {}
@@ -884,29 +884,25 @@ local originalSizes = {}
 local function createHitboxForPlayer(player)
     if player == game.Players.LocalPlayer then return end
     if not player.Character then return end
-    
+
     local character = player.Character
     local hrp = character:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-    
+
     local playerName = player.Name
-    
-    -- Salva tamanho original do HRP
+
     if not originalSizes[playerName] then
         originalSizes[playerName] = hrp.Size
     end
-    
-    -- MODIFICA O HRP DIRETAMENTE (isso que faz funcionar!)
+
     hrp.Size = Vector3.new(hitboxConfig.size, hitboxConfig.size, hitboxConfig.size)
-    hrp.Transparency = 0.9  -- Quase invisível mas ainda renderiza
+    hrp.Transparency = 0.9
     hrp.Material = Enum.Material.ForceField
     hrp.CanCollide = false
-    
-    -- Cria visualização (BoxHandleAdornment)
-    -- Remove visual antigo se existir
+
     local oldVisual = hrp:FindFirstChild("HitboxVisual")
     if oldVisual then oldVisual:Destroy() end
-    
+
     if hitboxConfig.visible then
         local box = Instance.new("BoxHandleAdornment")
         box.Name = "HitboxVisual"
@@ -918,7 +914,7 @@ local function createHitboxForPlayer(player)
         box.ZIndex = 1
         box.Parent = hrp
     end
-    
+
     hitboxParts[playerName] = hrp
 end
 
@@ -927,7 +923,6 @@ local function updateAllHitboxes()
         if player ~= game.Players.LocalPlayer and player.Character then
             local hrp = player.Character:FindFirstChild("HumanoidRootPart")
             if hrp then
-                -- Atualiza tamanho do HRP
                 local newSize = Vector3.new(hitboxConfig.size, hitboxConfig.size, hitboxConfig.size)
                 if hrp.Size ~= newSize then
                     hrp.Size = newSize
@@ -935,8 +930,6 @@ local function updateAllHitboxes()
                     hrp.Material = Enum.Material.ForceField
                     hrp.CanCollide = false
                 end
-                
-                -- Atualiza visual
                 local visual = hrp:FindFirstChild("HitboxVisual")
                 if hitboxConfig.visible then
                     if not visual then
@@ -951,12 +944,9 @@ local function updateAllHitboxes()
                     visual.Color3 = hitboxConfig.color
                     visual.Transparency = hitboxConfig.transparency
                 else
-                    if visual then
-                        visual:Destroy()
-                    end
+                    if visual then visual:Destroy() end
                 end
             else
-                -- Recria se não existe
                 createHitboxForPlayer(player)
             end
         end
@@ -1007,18 +997,18 @@ local function startHitbox()
     hitboxConnections.playerRemoving = game.Players.PlayerRemoving:Connect(function(player)
         local playerName = player.Name
         
-        -- Restaura tamanho original
-        if player.Character then
-            local hrp = player.Character:FindFirstChild("HumanoidRootPart")
-            if hrp and originalSizes[playerName] then
-                hrp.Size = originalSizes[playerName]
+        if hitboxParts[playerName] and hitboxParts[playerName].Parent then
+            local hrp = hitboxParts[playerName]
+            pcall(function()
+                local visual = hrp:FindFirstChild("HitboxVisual")
+                if visual then visual:Destroy() end
+                hrp.Size = originalSizes[playerName] or Vector3.new(2, 2, 1)
                 hrp.Transparency = 1
-                hrp.CanCollide = false
-            end
+            end)
         end
-        
+
         originalSizes[playerName] = nil
-        hitboxParts[playerName] = nil
+        hitboxParts[playerName]   = nil
         
         if hitboxConnections[playerName] then
             hitboxConnections[playerName]:Disconnect()
@@ -1044,22 +1034,15 @@ local function stopHitbox()
     for playerName, hrp in pairs(hitboxParts) do
         if hrp and hrp.Parent then
             pcall(function()
-                -- Remove visual
                 local visual = hrp:FindFirstChild("HitboxVisual")
                 if visual then visual:Destroy() end
-                
-                -- Restaura tamanho
-                if originalSizes[playerName] then
-                    hrp.Size = originalSizes[playerName]
-                else
-                    hrp.Size = Vector3.new(2, 2, 1) -- Tamanho padrão
-                end
+                hrp.Size = originalSizes[playerName] or Vector3.new(2, 2, 1)
                 hrp.Transparency = 1
                 hrp.CanCollide = false
             end)
         end
     end
-    
+
     hitboxParts = {}
     originalSizes = {}
 end
@@ -1068,22 +1051,31 @@ end
 
 local function CreateESP(targetPlayer)
     if targetPlayer == game.Players.LocalPlayer then return end
-    
+
     local function ApplyESP(character)
         if not character then return end
-        
-        -- Esperar o corpo carregar
+
         local root = character:WaitForChild("HumanoidRootPart", 3)
         if not root then return end
-        
-        -- 1. Highlight (contorno colorido)
+
+        -- ESTRATÉGIA FINAL: Highlight no character com Adornee = character.
+        -- Para evitar que o HRP expandido (hitbox) distorça o contorno,
+        -- usamos LocalTransparencyModifier=1 no HRP enquanto o Highlight está ativo.
+        -- Isso exclui o HRP do bounding box do Highlight sem afetar o hitbox real.
+        -- O HRP continua com o tamanho expandido para colisão — só o Highlight o ignora.
         local highlight = character:FindFirstChild("MoonHighlight") or Instance.new("Highlight")
-        highlight.Name = "MoonHighlight"
-        highlight.Parent = character
-        highlight.Adornee = character
-        highlight.FillTransparency = 1
+        highlight.Name            = "MoonHighlight"
+        highlight.Parent          = character
+        highlight.Adornee         = character
+        highlight.FillTransparency    = 1
         highlight.OutlineTransparency = 0
-        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.DepthMode       = Enum.HighlightDepthMode.AlwaysOnTop
+
+        -- Esconde o HRP do Highlight via LocalTransparencyModifier
+        -- (não afeta física nem o hitbox — só visual para o cliente local)
+        root.LocalTransparencyModifier = 1
+
+        local bodyModel = nil  -- sem model auxiliar nessa abordagem
         
         -- 2. Tag com nome do player
         local tag = root:FindFirstChild("MoonTag") or Instance.new("BillboardGui")
@@ -1134,7 +1126,7 @@ local function CreateESP(targetPlayer)
                 color = espConfig.sheriffColor
             end
             
-            -- Aplicar cores
+            -- Aplicar cor no highlight
             highlight.OutlineColor = color
             label.TextColor3 = color
             label.Text = targetPlayer.Name
@@ -1149,7 +1141,8 @@ local function CreateESP(targetPlayer)
             player = targetPlayer,
             connection = updateConnection,
             highlight = highlight,
-            tag = tag
+            tag = tag,
+            bodyModel = bodyModel
         })
     end
     
@@ -1226,12 +1219,17 @@ local function disablePlayerESP()
         if conn.connection and conn.connection.Connected then
             conn.connection:Disconnect()
         end
-        -- highlight/tag podem ter sido destruídos junto com o character — checar antes
+        -- highlight/tag/bodyModel podem ter sido destruídos junto com o character
         if conn.highlight and conn.highlight.Parent then
             conn.highlight:Destroy()
         end
         if conn.tag and conn.tag.Parent then
             conn.tag:Destroy()
+        end
+        -- Restaura LocalTransparencyModifier do HRP se ainda existir
+        if conn.player and conn.player.Character then
+            local hrp = conn.player.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then hrp.LocalTransparencyModifier = 0 end
         end
     end
     espConnections = {}
@@ -1240,16 +1238,14 @@ local function disablePlayerESP()
     for _, plr in pairs(game.Players:GetPlayers()) do
         if plr.Character then
             local highlight = plr.Character:FindFirstChild("MoonHighlight")
-            if highlight then
-                highlight:Destroy()
-            end
-            
+            if highlight then highlight:Destroy() end
+
             local root = plr.Character:FindFirstChild("HumanoidRootPart")
             if root then
                 local tag = root:FindFirstChild("MoonTag")
-                if tag then
-                    tag:Destroy()
-                end
+                if tag then tag:Destroy() end
+                -- Restaura LocalTransparencyModifier
+                root.LocalTransparencyModifier = 0
             end
         end
     end
@@ -2005,10 +2001,10 @@ game.Players.LocalPlayer.CharacterAdded:Connect(function(character)
     end
 
     -- Recacheia parts do noclip se estiver ativo
-    -- Sem isso, o Stepped itera sobre HRP/parts do personagem antigo (destruído)
     if noclipActive then
         cacheNoclipParts()
     end
+
 end)
 
 -- Garante que o estado inicial está correto
