@@ -1,61 +1,61 @@
-GUI local = loadstring(jogo:HttpGet("https://usemoon.xyz/library"))()
+local GUI = loadstring(game:HttpGet("https://usemoon.xyz/library"))()
 
-UDimSize local
-se jogo:GetService("UserInputService").Toque em Habilitado então
- UDimSize = UDim2.fromOffset(490, 290)
-outro
- UDimSize = UDim2.fromOffset(600, 335)
-fim
+local UDimSize
+if game:GetService("UserInputService").TouchEnabled then
+    UDimSize = UDim2.fromOffset(490, 290)
+else
+    UDimSize = UDim2.fromOffset(600, 335)
+end
 
-principal local = GUI:CreateWindow({
- Título = "MOON running in " .. identifyexecutor(),
- Subtítulo = "Mistério do Assassinato 2",
- Ícone = "lua",
- Largura da guia = 50,
- Tamanho = UDimSize,
- Tema = "supernova",
- MinimizeKey = Enum.KeyCode.M
+local main = GUI:CreateWindow({
+    Title = "MOON running in " .. identifyexecutor(),
+    SubTitle = "MM2",
+    Icon = "moon",
+    TabWidth = 50,
+    Size = UDimSize,
+    Theme = "supernova",
+    MinimizeKey = Enum.KeyCode.M
 })
 
-xerife localTab = main:AddTab({ Título = "Xerife", Ícone = "mira" })
-local murderTab = main:AddTab({ Título = "Assassinato", Ícone = "crânio" })
-local playerTab = main:AddTab({ Título = "Jogador", Ícone = "usuário" })
-local visualTab = main:AddTab({ Título = "Visual", Ícone = "olho" })
-local autoFarmTab = main:AddTab({ Título = "Auto Farm", Ícone = "zap" })
-configurações locaisTab = main:AddTab({ Título = "Configurações", Ícone = "configurações" })
+local sheriffTab = main:AddTab({ Title = "Sheriff", Icon = "crosshair" })
+local murderTab = main:AddTab({ Title = "Murder", Icon = "skull" })
+local playerTab = main:AddTab({ Title = "Player", Icon = "user" })
+local visualTab = main:AddTab({ Title = "Visual", Icon = "eye" })
+local autoFarmTab = main:AddTab({ Title = "Auto Farm", Icon = "zap" })
+local settingsTab = main:AddTab({ Title = "Settings", Icon = "settings" })
 
-funções locais = {}
-conexões locais = {}
+local functions = {}
+local connections = {}
 
-funções de função.createconnection(nome, origem, retorno de chamada, atraso)
- se conexões[nome] entidade
- conexões[nome]:Desconectar()
- fim
+function functions.createconnection(name, source, callback, delay)
+    if connections[name] then
+        connections[name]:Disconnect()
+    end
 
- local bloqueado = falso
+    local locked = false
 
- manipulador de função local(...)
- se atrasar então
- se bloqueado, retorne ao final
- bloqueado = verdadeiro
- tarefa.atraso(atraso, função()
- bloqueado = falso
- fim)
- fim
- retorno de chamada(...)
- fim
+    local function handler(...)
+        if delay then
+            if locked then return end
+            locked = true
+            task.delay(delay, function()
+                locked = false
+            end)
+        end
+        callback(...)
+    end
 
- sinal local =
- typeof(fonte) == "string" e game:GetService("RunService")[fonte]
- ou typeof(fonte) == "RBXScriptSignal" e fonte
- ou (tipo(fonte) == "tabela" e fonte.Conectar e fonte)
+    local signal =
+        typeof(source) == "string" and game:GetService("RunService")[source]
+        or typeof(source) == "RBXScriptSignal" and source
+        or (type(source) == "table" and source.Connect and source)
 
- se não sinalizar então
- retornar nulo
- fim
+    if not signal then
+        return nil
+    end
 
- conexões[nome] = sinal:Conectar(manipulador)
- conexões de retorno[nome]
+    connections[name] = signal:Connect(handler)
+    return connections[name]
 end
 
 function functions.closeconnection(name)
@@ -178,10 +178,10 @@ local savedBotaoPos = carregarPosicaoBotao() or UDim2.new(0.85, 0, 0.5, 0)
 -- ==================== UTILITÁRIOS ====================
 
 local function getPing()
-    local currentTime = tick()
-    if currentTime - lastPingUpdate > PING_UPDATE_INTERVAL then
-        pingCache = game.Players.LocalPlayer:GetNetworkPing() * 1000
-        lastPingUpdate = currentTime
+    local now = tick()
+    if now - lastPingUpdate > PING_UPDATE_INTERVAL then
+        pingCache      = game.Players.LocalPlayer:GetNetworkPing()
+        lastPingUpdate = now
     end
     return pingCache
 end
@@ -204,6 +204,12 @@ end
 
 local getGunAuto = false
 local getGunConn = nil
+
+local cachedPlayers = {}
+local function refreshPlayerCache()
+    cachedPlayers = game.Players:GetPlayers()
+end
+refreshPlayerCache()
 
 local function PegarArmaNoChao()
     local char = game.Players.LocalPlayer.Character
@@ -404,9 +410,9 @@ local function CalcularPredicaoRapida(alvoHRP, alvoAim, minhaPos)
     local pingTime = 0
     if sheriffConfig.PingPrediction then
         local ping = getPing()
-        pingTime = ping * 0.001 * sheriffConfig.PingSensitivity
-        if    ping > 150 then pingTime = pingTime * 1.35
-        elseif ping > 100 then pingTime = pingTime * 1.2 end
+        pingTime = ping * sheriffConfig.PingSensitivity
+        if    ping > 0.150 then pingTime = pingTime * 1.35
+        elseif ping > 0.100 then pingTime = pingTime * 1.2 end
     end
 
     local CONV_STUDS = 0.08
@@ -508,23 +514,19 @@ end
 -- ==================== AUTO SHOT - LÓGICA AVANÇADA ====================
 
 
+local _losRayParams = RaycastParams.new()
+_losRayParams.FilterType = Enum.RaycastFilterType.Blacklist
+
 local function hasLineOfSight(fromPos, toPos)
     if not autoShotConfig.wallCheck then return true end
-
-    local rayParams = RaycastParams.new()
-    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-    rayParams.FilterDescendantsInstances = {game.Players.LocalPlayer.Character}
-
-    local result = workspace:Raycast(fromPos, (toPos - fromPos), rayParams)
-
+    local char = game.Players.LocalPlayer.Character
+    if char then _losRayParams.FilterDescendantsInstances = { char } end
+    local result = workspace:Raycast(fromPos, (toPos - fromPos), _losRayParams)
     if result then
         local hitModel = result.Instance:FindFirstAncestorOfClass("Model")
-        if hitModel and game.Players:GetPlayerFromCharacter(hitModel) then
-            return true
-        end
+        if hitModel and game.Players:GetPlayerFromCharacter(hitModel) then return true end
         return false
     end
-
     return true
 end
 
@@ -563,9 +565,8 @@ local function AcharMelhorAlvo()
     local bestTarget = nil
     local bestScore = -math.huge
 
-    local players = game.Players:GetPlayers()
-    for i = 1, #players do
-        local v = players[i]
+    for i = 1, #cachedPlayers do
+        local v = cachedPlayers[i]
         if v ~= game.Players.LocalPlayer and v.Parent then
             local vChar = v.Character
             if vChar and vChar.Parent then
@@ -1089,73 +1090,7 @@ local function CreateESP(targetPlayer)
         label.TextStrokeTransparency = 0
         label.TextScaled = false
 
-        local updateConnection
-        local lastESPUpdate = 0
-        updateConnection = game:GetService("RunService").Heartbeat:Connect(function()
-            local now = tick()
-            if now - lastESPUpdate < 0.1 then return end
-            lastESPUpdate = now
-
-            if not character or not character.Parent then
-                if updateConnection then
-                    updateConnection:Disconnect()
-                    updateConnection = nil
-                end
-                for i = #espConnections, 1, -1 do
-                    local c = espConnections[i]
-                    if c.connection == updateConnection or
-                       (c.player == targetPlayer and not c.charConnection) then
-                        table.remove(espConnections, i)
-                    end
-                end
-                return
-            end
-
-            if not espConfig.enabled then return end
-
-            -- Esconde ESP ao spectar este jogador (câmera está dentro do personagem dele)
-            local cam = workspace.CurrentCamera
-            local isSpectating = cam and cam.CameraSubject
-                and (cam.CameraSubject == character:FindFirstChild("Humanoid")
-                  or cam.CameraSubject == character:FindFirstChild("HumanoidRootPart"))
-
-            if isSpectating then
-                highlight.OutlineTransparency = 1
-                tag.Enabled = false
-                if root and root.Parent then root.LocalTransparencyModifier = 0 end
-                return
-            else
-                highlight.OutlineTransparency = 0
-                if root and root.Parent then root.LocalTransparencyModifier = 1 end
-            end
-
-            local color = espConfig.innocentColor
-
-            local backpack = targetPlayer:FindFirstChild("Backpack")
-            local hasKnife = (backpack and backpack:FindFirstChild("Knife")) or character:FindFirstChild("Knife")
-            local hasGun   = (backpack and backpack:FindFirstChild("Gun"))   or character:FindFirstChild("Gun")
-
-            if hasKnife then
-                color = espConfig.murdererColor
-            elseif hasGun then
-                color = espConfig.sheriffColor
-            end
-
-            highlight.OutlineColor = color
-            label.TextColor3 = color
-            label.Text = targetPlayer.Name
-            label.TextSize = espConfig.nameSize
-
-            tag.Enabled = espConfig.nameEnabled and espConfig.enabled
-        end)
-
-        table.insert(espConnections, {
-            player = targetPlayer,
-            connection = updateConnection,
-            highlight = highlight,
-            tag = tag,
-            bodyModel = bodyModel
-        })
+                espDataMap[targetPlayer] = { highlight = highlight, tag = tag, root = root }
     end
 
     if targetPlayer.Character then
@@ -1168,6 +1103,50 @@ local function CreateESP(targetPlayer)
         connection = charConnection,
         charConnection = true
     })
+end
+
+local espDataMap   = {}
+local espHeartbeat = nil
+
+local function runESPUpdate()
+    local cam = workspace.CurrentCamera
+    for plr, data in pairs(espDataMap) do
+        local character = plr.Character
+        if not character or not character.Parent then continue end
+        local highlight = data.highlight
+        local tag       = data.tag
+        local root      = data.root
+        if not highlight or not highlight.Parent then continue end
+
+        local isSpectating = cam and cam.CameraSubject
+            and (cam.CameraSubject == character:FindFirstChild("Humanoid")
+              or cam.CameraSubject == character:FindFirstChild("HumanoidRootPart"))
+
+        if isSpectating then
+            highlight.OutlineTransparency = 1
+            tag.Enabled = false
+            if root and root.Parent then root.LocalTransparencyModifier = 0 end
+            continue
+        else
+            highlight.OutlineTransparency = 0
+            if root and root.Parent then root.LocalTransparencyModifier = 1 end
+        end
+
+        local color    = espConfig.innocentColor
+        local backpack = plr:FindFirstChild("Backpack")
+        local hasKnife = (backpack and backpack:FindFirstChild("Knife")) or character:FindFirstChild("Knife")
+        local hasGun   = (backpack and backpack:FindFirstChild("Gun"))   or character:FindFirstChild("Gun")
+        if hasKnife then color = espConfig.murdererColor
+        elseif hasGun then color = espConfig.sheriffColor end
+
+        highlight.OutlineColor = color
+        tag.Enabled = espConfig.nameEnabled
+        local label = tag:FindFirstChild("Label")
+        if label then
+            label.TextColor3 = color
+            label.TextSize   = espConfig.nameSize
+        end
+    end
 end
 
 local function enablePlayerESP()
@@ -1187,6 +1166,7 @@ local function enablePlayerESP()
         end
     end
     espConnections = {}
+    espDataMap     = {}
 
     for _, plr in pairs(game.Players:GetPlayers()) do
         CreateESP(plr)
@@ -1196,6 +1176,7 @@ local function enablePlayerESP()
     table.insert(espConnections, {connection = playerAddedConnection})
 
     local playerRemovingConnection = game.Players.PlayerRemoving:Connect(function(plr)
+        espDataMap[plr] = nil
         for i = #espConnections, 1, -1 do
             local conn = espConnections[i]
             if conn.player == plr then
@@ -1213,34 +1194,38 @@ local function enablePlayerESP()
         end
     end)
     table.insert(espConnections, {connection = playerRemovingConnection})
+    local lastESPTick = 0
+    espHeartbeat = game:GetService("RunService").Heartbeat:Connect(function()
+        local now = tick()
+        if now - lastESPTick < 0.1 then return end
+        lastESPTick = now
+        runESPUpdate()
+    end)
 end
 
 local function disablePlayerESP()
-    espRunning = false
+    espRunning        = false
     espConfig.enabled = false
+    if espHeartbeat then espHeartbeat:Disconnect(); espHeartbeat = nil end
 
     for _, conn in pairs(espConnections) do
         if conn.connection and conn.connection.Connected then
             conn.connection:Disconnect()
         end
-        if conn.highlight and conn.highlight.Parent then
-            conn.highlight:Destroy()
-        end
-        if conn.tag and conn.tag.Parent then
-            conn.tag:Destroy()
-        end
-        if conn.player and conn.player.Character then
-            local hrp = conn.player.Character:FindFirstChild("HumanoidRootPart")
-            if hrp then hrp.LocalTransparencyModifier = 0 end
-        end
     end
     espConnections = {}
 
+    for plr, data in pairs(espDataMap) do
+        if data.highlight and data.highlight.Parent then data.highlight:Destroy() end
+        if data.tag and data.tag.Parent then data.tag:Destroy() end
+        if data.root and data.root.Parent then data.root.LocalTransparencyModifier = 0 end
+    end
+    espDataMap = {}
+
     for _, plr in pairs(game.Players:GetPlayers()) do
         if plr.Character then
-            local highlight = plr.Character:FindFirstChild("MoonHighlight")
-            if highlight then highlight:Destroy() end
-
+            local hl = plr.Character:FindFirstChild("MoonHighlight")
+            if hl then hl:Destroy() end
             local root = plr.Character:FindFirstChild("HumanoidRootPart")
             if root then
                 local tag = root:FindFirstChild("MoonTag")
@@ -1421,16 +1406,20 @@ end
 local speedWatchConn = nil
 local jumpWatchConn  = nil
 
+local _hookDebounce = false
+
 local function hookHumanoidStats(humanoid)
     if speedWatchConn then speedWatchConn:Disconnect() end
     if jumpWatchConn  then jumpWatchConn:Disconnect()  end
 
     speedWatchConn = humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+        if _hookDebounce then return end
         if MY_SPEED ~= 16 and humanoid.WalkSpeed ~= MY_SPEED then
             humanoid.WalkSpeed = MY_SPEED
         end
     end)
     jumpWatchConn = humanoid:GetPropertyChangedSignal("JumpPower"):Connect(function()
+        if _hookDebounce then return end
         if MY_JUMP ~= 50 and humanoid.JumpPower ~= MY_JUMP then
             humanoid.JumpPower = MY_JUMP
         end
@@ -1979,7 +1968,12 @@ end
 
 -- ==================== INICIALIZAÇÃO ====================
 
+game.Players.PlayerAdded:Connect(function()
+    refreshPlayerCache()
+end)
+
 game.Players.PlayerRemoving:Connect(function(player)
+    refreshPlayerCache()
     local char = player.Character
     if char then
         local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -1991,12 +1985,16 @@ game.Players.PlayerRemoving:Connect(function(player)
 end)
 
 game.Players.LocalPlayer.CharacterAdded:Connect(function(character)
+    -- Debounce ativo durante o spawn: impede hookHumanoidStats de reaplicar
+    -- speed/jump enquanto o MM2 ainda está distribuindo roles e resetando stats
+    _hookDebounce = true
+
     task.wait(0.5)
 
-    podeAtirar = true
+    podeAtirar    = true
     equipAttempts = 0
 
-    velocityHistory = {}
+    velocityHistory     = {}
     accelerationHistory = {}
 
     for _, plr in pairs(game.Players:GetPlayers()) do
@@ -2010,24 +2008,25 @@ game.Players.LocalPlayer.CharacterAdded:Connect(function(character)
 
     local humanoid = character:WaitForChild("Humanoid", 5)
     if humanoid then
-        if MY_SPEED ~= 16 then
-            humanoid.WalkSpeed = MY_SPEED
-        end
-        if MY_JUMP ~= 50 then
-            humanoid.JumpPower = MY_JUMP
-        end
         hookHumanoidStats(humanoid)
+        -- Aguarda o MM2 terminar de inicializar o personagem (distribuição de roles)
+        -- antes de reaplicar speed/jump para não causar loop de reset
+        task.wait(1.5)
+        _hookDebounce = false
+        if MY_SPEED ~= 16 then humanoid.WalkSpeed = MY_SPEED end
+        if MY_JUMP  ~= 50 then humanoid.JumpPower  = MY_JUMP  end
+    else
+        task.wait(1.5)
+        _hookDebounce = false
     end
 
     if sheriffConfig.showButton and not botaoTela then
-        task.wait(0.5)
         CriarBotaoTela()
     end
 
     if noclipActive then
         cacheNoclipParts()
     end
-
 end)
 
 podeAtirar = true
